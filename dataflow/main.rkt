@@ -31,7 +31,6 @@
 
 (define constant-rank 0)
 (define input-rank 1)
-(define previous-rank 1)
 
 (struct constant (value)
         #:methods gen:signal
@@ -124,33 +123,39 @@
 ;;
 ;; The 'prev' operator:
 ;;
-;;      E       E      E
-;; 0000011111111222222233333 x
-;; 0000001111111122222222222 (prev x)
-;; 0000000000000011111112222 (prev (prev x))
-;;      E       E      E
-;; 0000000000000111111122222 y = (y + (prev x)) ; y(0) = 0
-;; 0000011111111333333366666 z = ((prev z) + x) ; z(0) = 0
-;; 0000001111111133333336666 (prev z)
+;; IEEE
+;; 01234 x2 :=
+;; 00123 x1 := (prev x2 0)
+;; 00012 x0 := (prev x1 0)
+;; 01369 y := ((lift +) x0 x1 x2)
+;;
+;; In this version, (prev x), (prev (prev x)), etc. have increasing
+;; ranks.
 
-(struct previous-rep (source boxed-value boxed-sinks boxed-stale?)
+;; NOTE: This version wastes some space, recording the current value
+;; of the source. This cache allows the previous node to update after
+;; its source. It could be eliminated by arranging for previous
+;; operators to update just before their sources.
+(struct previous-rep (source boxed-current-value boxed-value boxed-sinks boxed-stale?)
         #:methods gen:signal
         ((define/generic generic-signal-rank signal-rank)
-         (define (signal-rank signal) previous-rank))
+         (define (signal-rank signal) (+ 1 (generic-signal-rank (previous-source signal)))))
         #:methods gen:source
         ((define (source-value source) (unbox (previous-boxed-value source)))
          (define (source-add-sink source sink) (add-sink (previous-boxed-sinks source) sink)))
         #:methods gen:sink
         ((define (sink-stale sink)
-           (queue-prev-update (previous-boxed-stale? sink) sink)
+           (queue-update (previous-boxed-stale? sink) sink)
            ;; queue sinks right away.
            (queue-sinks (previous-boxed-sinks sink)))
          (define (sink-update sink)
            (set-box! (previous-boxed-stale? sink) #f)
-           (set-box! (previous-boxed-value sink) (source-value (previous-source sink))))
+           (set-box! (previous-boxed-value sink) (unbox (previous-boxed-current-value sink)))
+           (set-box! (previous-boxed-current-value sink) (source-value (previous-source sink))))
          ))
 
 (define previous-source previous-rep-source)
+(define previous-boxed-current-value previous-rep-boxed-current-value)
 (define previous-boxed-value previous-rep-boxed-value)
 (define previous-boxed-sinks previous-rep-boxed-sinks)
 (define previous-boxed-stale? previous-rep-boxed-stale?)
@@ -158,7 +163,8 @@
 (define (previous source initial-value)
   (if (= constant-rank (signal-rank source))
       (constant initial-value)
-      (let ((p  (previous-rep source (box initial-value) (box '()) (box #f))))
+      (let ((p  (previous-rep source (box (source-value source))
+                              (box initial-value) (box '()) (box #f))))
         (source-add-sink source p)
         p)))
 
@@ -183,17 +189,6 @@
 
 (define stale-nodes (fingertree))
 
-;; Luckily, the start of any chains of previouses will be right to
-;; left in this list, so it will work to update left to right.
-(define stale-prev-nodes '())
-
-(define (queue-prev-update boxed-stale? sink)
-  (unless (unbox boxed-stale?)
-    ;; !!! ISSUE: should be queueing the sink in its weak box !!!
-    ;; this is mentioned in the frtime thesis section 2.6.1.
-    (set! stale-prev-nodes (cons sink stale-prev-nodes))
-    (set-box! boxed-stale? #t)))
-
 (define (queue-update boxed-stale? sink)
   (unless (unbox boxed-stale?)
           ;; !!! ISSUE: should be queueing the sink in its weak box !!!
@@ -213,8 +208,7 @@
                (loop))
              (lambda (pq)
                (error "propagate: Shouldn't be here." pq)))))
-  (for-each sink-update stale-prev-nodes)
-  (set! stale-prev-nodes '()))
+  )
 
 (module+
  test
@@ -244,9 +238,9 @@
         (x0 (previous x1 1))
         (y ((lift +) x0 x1)))
    ;; 1 + 1
-   (check = 1 (source-value y))
+   (check = 2 (source-value y))
 
-   ;; 1 + 2
+   ;; 2 + 1
    (event x1 2)
    (propagate)
    (check = 3 (source-value y))
@@ -262,19 +256,22 @@
         (y ((lift +) ((lift +) x0 x1) x2)))
    ;; 0, 0, 1
    (check = 1 (source-value y))
-
+   (printf "::: ~s\n" (map source-value (list y x0 x1 x2)))
    ;; 0, 1, 2
    (event x2 2)
    (propagate)
-   (check = 4 (source-value y))
+   (printf "::: ~s\n" (map source-value (list y x0 x1 x2)))
+   (check = 3 (source-value y))
 
    ;; 1, 2, 3
    (event x2 3)
    (propagate)
+   (printf "::: ~s\n" (map source-value (list y x0 x1 x2)))
    (check = 6 (source-value y))
 
    ;; 2, 3, 4
    (event x2 4)
    (propagate)
+   (printf "::: ~s\n" (map source-value (list y x0 x1 x2)))
    (check = 9 (source-value y)))
  )
