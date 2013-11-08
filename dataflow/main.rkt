@@ -11,11 +11,27 @@
 
 (define-generics source
   (source-value source)
-  (source-add-sink source sink))
+  (source-add-sink source sink)
+  (source-add-prev source initial-value))
 
 (define-generics sink
   (sink-stale sink)
   (sink-update sink))
+
+(define (add-prev-helper source initial-value boxed-prevs)
+  (define p (previous-rep source (box initial-value) (box '()) (box '())))
+  (add-sink boxed-prevs p)
+  p)
+
+(define (update-prevs-helper current-value boxed-prevs)
+  (for-each
+   (lambda (weak-boxed-prev)
+     (let ((prev (weak-box-value weak-boxed-prev)))
+       ;; NOTE: The prev might have been garbage collected.
+       ;; ISSUE: should get rid of the links to gc-ed prevs.
+       (when (previous-rep? prev)
+         (previous-update prev current-value))))
+   (unbox boxed-prevs)))
 
 (define (add-sink boxed-sinks sink)
   (set-box! boxed-sinks (cons (make-weak-box sink) (unbox boxed-sinks))))
@@ -37,23 +53,29 @@
         ((define (signal-rank signal) constant-rank))
         #:methods gen:source
         ((define (source-value source) (constant-value source))
-         (define (source-add-sink source sink) (void))))
+         (define (source-add-sink source sink) (void))
+         (define (source-add-prev source initial-value) (constant initial-value))))
 
-(struct input-rep (boxed-value boxed-sinks)
+(struct input-rep (boxed-value boxed-sinks boxed-prevs)
         #:methods gen:signal
         ((define (signal-rank signal) input-rank))
         #:methods gen:source
         ((define (source-value source) (unbox (input-boxed-value source)))
          (define (source-add-sink source sink)
-           (add-sink (input-boxed-sinks source) sink))))
+           (add-sink (input-boxed-sinks source) sink))
+         (define (source-add-prev source initial-value)
+           (add-prev-helper source initial-value (input-boxed-prevs source)))))
 
 (define input-boxed-value input-rep-boxed-value)
 (define input-boxed-sinks input-rep-boxed-sinks)
+(define input-boxed-prevs input-rep-boxed-prevs)
 
 (define (input initial-value)
-  (input-rep (box initial-value) (box '())))
+  (input-rep (box initial-value) (box '()) (box '())))
 
 (define (event i val)
+  (update-prevs-helper (unbox (input-boxed-value i))
+                       (input-boxed-prevs i))
   (set-box! (input-boxed-value i) val)
   (queue-sinks (input-boxed-sinks i))
   (void))
@@ -79,17 +101,21 @@
   (source-add-sink source o)
   o)
 
-(struct fn (rank boxed-value boxed-sinks snap boxed-stale?)
+(struct fn (rank boxed-value boxed-sinks boxed-prevs snap boxed-stale?)
         #:methods gen:signal
         ((define (signal-rank signal) (fn-rank signal)))
         #:methods gen:source
         ((define (source-value source) (unbox (fn-boxed-value source)))
          (define (source-add-sink source sink)
-           (add-sink (fn-boxed-sinks source) sink)))
+           (add-sink (fn-boxed-sinks source) sink))
+         (define (source-add-prev source initial-value)
+           (add-prev-helper source initial-value (fn-boxed-prevs source))))
         #:methods gen:sink
         ((define (sink-stale sink)
            (queue-update (fn-boxed-stale? sink) sink))
          (define (sink-update sink)
+           (update-prevs-helper (unbox (fn-boxed-value sink))
+                                (fn-boxed-prevs sink))
            (set-box! (fn-boxed-stale? sink) #f)
            (set-box! (fn-boxed-value sink) ((fn-snap sink)))
            (queue-sinks (fn-boxed-sinks sink))
@@ -114,7 +140,7 @@
           ;; constant source:
           (constant initial-value)
           ;; not constant source:
-          (let ((f (fn (+ max-arg-rank 1) (box initial-value) (box '()) snap (box #f))))
+          (let ((f (fn (+ max-arg-rank 1) (box initial-value) (box '()) (box '()) snap (box #f))))
             (for-each (lambda (arg) (source-add-sink arg f)) args)
             f)))))
 
@@ -129,44 +155,33 @@
 ;; 00012 x0 := (prev x1 0)
 ;; 01369 y := ((lift +) x0 x1 x2)
 ;;
-;; In this version, (prev x), (prev (prev x)), etc. have increasing
-;; ranks.
+;; In this version, (prev x), (prev (prev x)), etc. have the same
+;; rank as x itself.
 
-;; NOTE: This version wastes some space, recording the current value
-;; of the source. This cache allows the previous node to update after
-;; its source. It could be eliminated by arranging for previous
-;; operators to update just before their sources.
-(struct previous-rep (source boxed-current-value boxed-value boxed-sinks boxed-stale?)
+(struct previous-rep (source boxed-value boxed-sinks boxed-prevs)
         #:methods gen:signal
         ((define/generic generic-signal-rank signal-rank)
-         (define (signal-rank signal) (+ 1 (generic-signal-rank (previous-source signal)))))
+         (define (signal-rank signal) (generic-signal-rank (previous-source signal))))
         #:methods gen:source
         ((define (source-value source) (unbox (previous-boxed-value source)))
-         (define (source-add-sink source sink) (add-sink (previous-boxed-sinks source) sink)))
-        #:methods gen:sink
-        ((define (sink-stale sink)
-           (queue-update (previous-boxed-stale? sink) sink)
-           ;; queue sinks right away.
-           (queue-sinks (previous-boxed-sinks sink)))
-         (define (sink-update sink)
-           (set-box! (previous-boxed-stale? sink) #f)
-           (set-box! (previous-boxed-value sink) (unbox (previous-boxed-current-value sink)))
-           (set-box! (previous-boxed-current-value sink) (source-value (previous-source sink))))
-         ))
+         (define (source-add-sink source sink)
+           (add-sink (previous-boxed-sinks source) sink))
+         (define (source-add-prev source initial-value)
+           (add-prev-helper source initial-value (previous-boxed-prevs source)))))
+
+(define (previous-update p next)
+  (update-prevs-helper (unbox (previous-boxed-value p))
+                       (previous-boxed-prevs p))
+  (set-box! (previous-boxed-value p) next)
+  (queue-sinks (previous-boxed-sinks p)))
 
 (define previous-source previous-rep-source)
-(define previous-boxed-current-value previous-rep-boxed-current-value)
 (define previous-boxed-value previous-rep-boxed-value)
 (define previous-boxed-sinks previous-rep-boxed-sinks)
-(define previous-boxed-stale? previous-rep-boxed-stale?)
+(define previous-boxed-prevs previous-rep-boxed-prevs)
 
 (define (previous source initial-value)
-  (if (= constant-rank (signal-rank source))
-      (constant initial-value)
-      (let ((p  (previous-rep source (box (source-value source))
-                              (box initial-value) (box '()) (box #f))))
-        (source-add-sink source p)
-        p)))
+  (source-add-prev source initial-value))
 
 (require persistent/measured-fingertree-sig)
 (require persistent/measured-fingertree-unit)
